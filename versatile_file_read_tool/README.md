@@ -94,7 +94,7 @@ file_read_tool = VersatileFileReadTool(
 )
 
 content = file_read_tool.run(
-    file_path="dracula_by_bram_stoker.txt"
+    file_path="/path/to/your/file.txt"
 )
 
 print(f"Retrieved {len(content)} chars")
