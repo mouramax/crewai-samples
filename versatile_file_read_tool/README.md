@@ -2,7 +2,7 @@
 
 ## Description
 
-The `VersatileFileReadTool` is a powerful and flexible tool, offering flexible and powerful ways to read and process content from files. It expands upon basic file reading by introducing multiple retrieval strategies, including full content extraction, partial reads based on character limits (head truncation), intelligent chunking for large files (random chunks), and AI-powered summarization.
+The `VersatileFileReadTool` offers a robust and adaptable approach to reading and processing content from various file types. It significantly enhances standard file reading methods by providing multiple retrieval strategies: complete content extraction, partial reads limited by character count (head truncation), intelligent chunking for sampling large files (random chunks), and AI-driven summarization.
 
 This tool is invaluable for tasks requiring interaction with file data, such as:
 -   Processing text files for information extraction.

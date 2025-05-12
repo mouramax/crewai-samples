@@ -2,7 +2,7 @@
 
 ## Description
 
-The `VersatileScrapeWebsiteTool` is a powerful and flexible tool, designed for scraping and processing content from websites. It expands upon basic web scraping by introducing multiple retrieval strategies, including full content extraction, partial reads based on character limits (head truncation), intelligent chunking for large files (random chunks), and AI-powered summarization.
+The `VersatileScrapeWebsiteTool` is a comprehensive and flexible solution for scraping and processing content from websites. It advances beyond basic web scraping by offering diverse retrieval strategies: full text extraction from web pages, partial content retrieval based on character limits (head truncation), intelligent chunking for an overview of large pages (random chunks), and AI-powered summarization.
 
 This tool is essential for agents that need to gather information from the web, such as:
 -   Extracting textual data from articles, blogs, or documentation.
