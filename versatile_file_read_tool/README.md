@@ -2,7 +2,7 @@
 
 ## Description
 
-The `VersatileFileReadTool` offers a robust and adaptable approach to reading and processing content from various file types. It significantly enhances standard file reading methods by providing multiple retrieval strategies: complete content extraction, partial reads limited by character count (head truncation), intelligent chunking for sampling large files (random chunks), and AI-driven summarization.
+The `VersatileFileReadTool` offers a robust and adaptable approach to reading and processing content from various file types. It significantly enhances standard file reading methods by providing multiple retrieval strategies: complete content extraction, partial reads limited by character count (head truncation), intelligent chunking for sampling large files (random chunks), and AI-driven summarization. **The specific retrieval strategy (`retrieval_mode`), character limits (`max_chars`), line ranges (`start_line`, `line_count`), and LLM (for summarization) are configured when the tool is initialized and cannot be changed at runtime by an agent.**
 
 This tool is invaluable for tasks requiring interaction with file data, such as:
 -   Processing text files for information extraction.
@@ -14,15 +14,15 @@ It supports text-based files and reads them using UTF-8 encoding, with error han
 
 ## Key Features
 
--   **Multiple Retrieval Modes**:
-    -   `full`: Reads the entire file or a specified range of lines (using `start_line` and `line_count`).
-    -   `head`: Reads the first `N` characters of a file (using `max_chars`).
-    -   `random_chunks`: Extracts a strategic selection of blocks (first, last, and random middle blocks) from a file, useful for getting a sense of large files within a character limit (`max_chars`). Each selected block is followed by "..." to indicate potential discontinuity.
-    -   `summarize`: Uses a provided Language Model (LLM) to generate a summary of the file's content. It internally uses the `random_chunks` method to select a substantial portion of the file for summarization.
--   **Configurable Defaults**: The tool can be initialized with default settings for file path, retrieval mode, character limits, and LLM instance, which can be overridden at runtime.
--   **UTF-8 Encoding**: Enforces reading files with UTF-8 encoding and includes an option to ignore encoding errors.
--   **Intelligent Truncation**: For modes like `head` and `random_chunks`, if the file's total content is smaller than the specified `max_chars`, the full content is returned without truncation.
--   **Error Handling**: Provides clear error messages for issues like file not found, permission errors, or problems during summarization.
+-   **Multiple Retrieval Modes (Set at Initialization)**:
+    -   `full`: Reads the entire file or a specified range of lines (using `start_line` and `line_count` set during initialization).
+    -   `head`: Reads the first `N` characters of a file (using `max_chars` set during initialization).
+    -   `random_chunks`: Extracts a strategic selection of blocks (first, last, and random middle blocks) from a file, useful for getting a sense of large files within a character limit (`max_chars` set during initialization). Each selected block is followed by "..." to indicate potential discontinuity.
+    -   `summarize`: Uses a Language Model (LLM) provided during initialization to generate a summary of the file's content. It internally uses the `random_chunks` method to select a substantial portion of the file for summarization.
+-   **Configurable Defaults at Initialization**: The tool is initialized with settings for file path, retrieval mode, character limits, line ranges, and LLM instance. Only the `file_path` can be overridden when the `run` method is called. The tool's description dynamically updates to reflect the configured defaults.
+-   **UTF-8 Encoding**: Reads files with UTF-8 encoding and ignores errors.
+-   **Intelligent Truncation**: For modes like `head` and `random_chunks`, if the file's total content is smaller than the `max_chars` set during initialization, the full content is returned without truncation.
+-   **Error Handling**: Raises appropriate Python exceptions for issues like file not found, permission errors, invalid line numbers, missing required initialization parameters (like `max_chars` or `llm` for specific modes), or problems during summarization.
 
 ## Example Usage
 
@@ -103,32 +103,28 @@ print(content)
 
 ## Arguments
 
-The tool can be configured at initialization and its behavior further refined by arguments passed to the `run` method. Runtime arguments override initialization defaults.
+The tool is configured at initialization. Only the `file_path` can be optionally overridden when calling the `run` method.
 
-### Initialization Parameters:
--   `file_path` (Optional[str]): Default path to the file.
--   `retrieval_mode` (Optional[Literal["full", "head", "random_chunks", "summarize"]]): Default retrieval strategy. Defaults to `"full"`.
--   `start_line` (Optional[int]): Default starting line for `"full"` mode (1-indexed). Defaults to 1.
--   `line_count` (Optional[int]): Default number of lines to read for `"full"` mode. Defaults to `None` (read to end).
--   `max_chars` (Optional[int]): Default maximum characters for `"head"` or `"random_chunks"` modes.
--   `llm` (Optional[BaseLLM]): Default LLM instance for `"summarize"` mode.
+### Initialization Parameters (`__init__`):
+-   `file_path` (Optional[str]): Default path to the file if none is provided to `run`.
+-   `retrieval_mode` (Optional[Literal["full", "head", "random_chunks", "summarize"]]): Retrieval strategy to use. Defaults to `"full"`. **This cannot be changed after initialization.**
+-   `start_line` (Optional[int]): Default starting line for `"full"` mode (1-indexed). Defaults to 1. **This cannot be changed after initialization.**
+-   `line_count` (Optional[int]): Default number of lines to read for `"full"` mode. Defaults to `None` (read to end). **This cannot be changed after initialization.**
+-   `max_chars` (Optional[int]): Default maximum characters for `"head"` or `"random_chunks"` modes. Required if using these modes. **This cannot be changed after initialization.**
+    -   For `'random_chunks'`, if a value less than 3000 is provided, it will be internally adjusted to 3000.
+-   `llm` (Optional[BaseLLM]): An LLM instance (compatible with `crewai.llms.base_llm.BaseLLM`) for `"summarize"` mode. Required if `retrieval_mode` is `"summarize"`. **This cannot be changed after initialization.**
 -   `name` (Optional[str]): Custom name for the tool instance.
--   `description` (Optional[str]): Custom description for the tool instance.
+-   `description` (Optional[str]): Custom base description for the tool instance. Details about configured defaults are appended to this.
+-   `**kwargs`: Additional keyword arguments passed to `BaseTool`.
 
 ### Runtime `run` Method Parameters (defined in `VersatileFileReadToolSchema`):
--   `file_path` (Optional[str]): Path to the file. If provided, overrides the initialized `default_file_path`. Mandatory if no default is set.
--   `retrieval_mode` (Optional[Literal["full", "head", "random_chunks", "summarize"]]): The retrieval strategy to use for this specific run. Overrides `default_retrieval_mode`.
--   `start_line` (Optional[int]): Line number to start reading from (1-indexed). Primarily used in `'full'` mode.
--   `line_count` (Optional[int]): Number of lines to read. Primarily used in `'full'` mode. If `None`, reads from `start_line` to the end of the file.
--   `max_chars` (Optional[int]): Maximum characters for `'head'` or `'random_chunks'` modes.
-    -   For `'random_chunks'`, if a value less than 3000 is provided, it will be internally adjusted to 3000.
--   `llm` (Optional[BaseLLM]): An LLM instance for `'summarize'` mode. Required if `retrieval_mode` is `'summarize'` and no `default_llm` was set at initialization.
+-   `file_path` (Optional[str]): Path to the file to read. If provided, overrides the `file_path` set during initialization (if any). Mandatory if no default `file_path` was set during initialization.
+-   **Other parameters like `retrieval_mode`, `start_line`, `line_count`, `max_chars`, `llm` cannot be provided or changed at runtime via the `run` method.** The values set during initialization will always be used.
 
 ## Error Handling
 
-The tool returns descriptive error messages as strings if:
--   The specified file is not found.
--   There are permission issues accessing the file.
--   Required parameters for a chosen mode are missing (e.g., `max_chars` for `head` mode, `llm` for `summarize` mode).
--   The LLM fails to generate a valid summary after multiple attempts in `summarize` mode.
--   `start_line` is out of bounds in `full` mode.
+The tool raises Python exceptions for various error conditions:
+-   `ValueError`: For invalid or missing essential parameters during initialization (e.g., `max_chars` when required by the mode, `llm` for summarize mode) or if `file_path` is missing at both initialization and runtime. Also raised if `start_line` is invalid for the file size in `full` mode.
+-   `FileNotFoundError`: If the specified `file_path` does not exist.
+-   `PermissionError`: If the program lacks permissions to read the file at `file_path`.
+-   `RuntimeError`: For unexpected issues during file operations or processing, or if the LLM fails repeatedly during summarization.
