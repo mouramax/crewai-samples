@@ -16,25 +16,8 @@ class VersatileScrapeWebsiteToolSchema(BaseModel):
 
     website_url: Optional[str] = Field(
         default=None,
-        description=("Mandatory website canonical URL to scrape."),
-    )
-    retrieval_mode: Optional[
-        Literal["full", "head", "random_chunks", "summarize"]
-    ] = Field(
-        default=None,
-        description=("Strategy for retrieving website content."),
-    )
-    max_chars: Optional[int] = Field(
-        default=None,
         description=(
-            "Maximum characters for 'head' or 'random_chunks' modes."
-        ),
-    )
-    llm: Optional[BaseLLM] = Field(
-        default=None,
-        description=(
-            "LLM instance for 'summarize' mode. Must be provided if "
-            "'summarize' mode is active."
+            "Mandatory website canonical URL to scrape."
         ),
     )
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -132,6 +115,9 @@ class VersatileScrapeWebsiteTool(BaseTool):
             elif isinstance(cookies, dict):  # Direct cookies
                 self.cookies = cookies
 
+        # Start with the base description (either default or provided)
+        base_desc = self.description
+
         desc_details_list = []
         if self.default_website_url:
             desc_details_list.append(
@@ -139,7 +125,7 @@ class VersatileScrapeWebsiteTool(BaseTool):
             )
 
         desc_details_list.append(
-            f"Default mode: '{self.default_retrieval_mode}'."
+            f"Configured retrieval mode: '{self.default_retrieval_mode}'."
         )
 
         if (
@@ -147,34 +133,36 @@ class VersatileScrapeWebsiteTool(BaseTool):
             and self.default_max_chars is not None
         ):
             desc_details_list.append(
-                f"Default 'max_chars': {self.default_max_chars}."
+                f"Configured 'max_chars': {self.default_max_chars}."
             )
+        elif self.default_retrieval_mode in ["head", "random_chunks"]:
+             desc_details_list.append(
+                f"Warning: Mode '{self.default_retrieval_mode}' selected but "
+                "'max_chars' was not set during initialization."
+            )
+
 
         if self.default_retrieval_mode == "summarize":
             if self.default_llm:
                 desc_details_list.append(
-                    "Configured for summarization with a default LLM."
+                    "Configured for summarization with a provided LLM."
                 )
             else:
                 desc_details_list.append(
-                    "For 'summarize' mode, an LLM must be provided at "
-                    "runtime if no default is set."
+                    "Warning: Mode 'summarize' selected but 'llm' was not "
+                    "provided during initialization."
                 )
 
         desc_suffix = ""
         if desc_details_list:
             desc_suffix = " " + " ".join(desc_details_list)
 
-        self.description = f"{self.description}{desc_suffix}"
+        # Set the final description including details
+        self.description = f"{base_desc}{desc_suffix}"
 
     def _run(
         self,
         website_url: Optional[str] = None,
-        retrieval_mode: Optional[
-            Literal["full", "head", "random_chunks", "summarize"]
-        ] = None,
-        max_chars: Optional[int] = None,
-        llm: Optional[BaseLLM] = None,
     ) -> str:
         eff_url = (
             website_url
@@ -182,30 +170,32 @@ class VersatileScrapeWebsiteTool(BaseTool):
             else self.default_website_url
         )
         if eff_url is None:
-            raise ValueError("Website canonical URL is required.")
+            raise ValueError(
+                "Website canonical URL is required."
+            )
 
-        eff_mode = (
-            retrieval_mode
-            if retrieval_mode is not None
-            else self.default_retrieval_mode
-        )
-        eff_mc = max_chars if max_chars is not None else self.default_max_chars
+        # Use the retrieval mode, max_chars, and llm set during initialization
+        eff_mode = self.default_retrieval_mode
+        eff_mc = self.default_max_chars
+        current_llm = self.default_llm
 
-        current_llm = llm
-        if not isinstance(current_llm, BaseLLM) and self.default_llm:
-            current_llm = self.default_llm
-
+        # Validate parameters based on the initialized mode
         if eff_mode == "head" and eff_mc is None:
-            raise ValueError("'max_chars' is required for 'head' mode.")
+            raise ValueError(
+                "'max_chars' must be set during initialization for 'head' mode."
+            )
         if eff_mode == "random_chunks":
             if eff_mc is None:
                 raise ValueError(
-                    "'max_chars' is required for 'random_chunks' mode."
+                    "'max_chars' must be set during initialization for "
+                    "'random_chunks' mode."
                 )
+            # Ensure minimum max_chars for random_chunks internally
             eff_mc = max(eff_mc, self._RANDOM_CHUNKS_MIN_MAX_CHARS)
         if eff_mode == "summarize" and not isinstance(current_llm, BaseLLM):
             raise ValueError(
-                "A valid LLM instance is required for 'summarize' mode."
+                "A valid LLM instance must be provided during initialization "
+                "for 'summarize' mode."
             )
 
         try:
@@ -230,23 +220,25 @@ class VersatileScrapeWebsiteTool(BaseTool):
             if eff_mode == "full":
                 return text_content
 
-            # For other modes, check size against max_chars if applicable
+            # Check size against max_chars for modes that use it
             if eff_mode in ["head", "random_chunks"] and eff_mc is not None:
                 if len(text_content) <= eff_mc:
                     return text_content  # Return full if under limit
 
             if eff_mode == "head":
-                return self._retrieve_head_content(text_content, eff_mc)  # type: ignore
+                # eff_mc is guaranteed non-None here due to prior validation
+                return self._retrieve_head_content(text_content, eff_mc) # type: ignore
             elif eff_mode == "random_chunks":
-                return self._retrieve_random_chunks_content(text_content, eff_mc)  # type: ignore
+                # eff_mc is guaranteed non-None here due to prior validation
+                return self._retrieve_random_chunks_content(text_content, eff_mc) # type: ignore
             elif eff_mode == "summarize":
+                # current_llm is guaranteed valid BaseLLM here due to prior validation
                 return self._retrieve_summarized_content(
                     text_content,
                     current_llm,  # type: ignore
                 )
             else:
                 raise ValueError(f"Unknown retrieval mode '{eff_mode}'.")
-
         except requests.exceptions.RequestException as e:
             raise RuntimeError(
                 f"Error scraping website {eff_url}: {str(e)}"
@@ -310,8 +302,13 @@ class VersatileScrapeWebsiteTool(BaseTool):
     def _retrieve_summarized_content(
         self, full_content: str, llm: BaseLLM
     ) -> str:
+        context_max_chars = self.default_max_chars if self.default_max_chars is not None else self._SUMMARY_MODE_INTERNAL_MAX_CHARS
+        # Ensure it meets the minimum for random_chunks if using default_max_chars
+        if self.default_max_chars is not None:
+            context_max_chars = max(context_max_chars, self._RANDOM_CHUNKS_MIN_MAX_CHARS)
+
         context_for_summary = self._retrieve_random_chunks_content(
-            full_content, self._SUMMARY_MODE_INTERNAL_MAX_CHARS
+            full_content, context_max_chars
         )
         if not context_for_summary.strip():
             raise ValueError("No content extracted from website to summarize.")
