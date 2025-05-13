@@ -4,7 +4,7 @@ This repository contains a collection of simple, practical code samples for the 
 
 ## Disclaimer
 
-These samples are provided by community contributors and are **not officially endorsed by CrewAI or the CrewAI team**. They are meant for educational purposes and to demonstrate different ways to use the framework.
+The code in this repository represents my personal exploration of the CrewAI framework and is **not officially endorsed by the CrewAI team**. I created these samples for educational purposes and to demonstrate various ways to use CrewAI.  You are welcome to use, adapt, and learn from this code.
 
 ## Contents
 
@@ -29,10 +29,6 @@ Each sample is contained in its own directory with clear instructions on how to 
    ```
 
 3. Install any required dependencies and follow the sample-specific instructions
-
-## Contributing
-
-Contributions are welcome! If you have a useful sample or snippet to share, please submit a pull request.
 
 ## License
 
