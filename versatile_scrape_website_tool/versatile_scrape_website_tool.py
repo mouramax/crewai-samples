@@ -1,264 +1,318 @@
 import math
-import os
 import random
 import re
-from typing import Any, Dict, List, Literal, Optional, Set, Type
+from typing import Dict, Literal, Optional, Set, Type
 
 import requests
 from bs4 import BeautifulSoup
 from crewai.llms.base_llm import BaseLLM
 from crewai.tools.base_tool import BaseTool
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    model_validator,
+)
+
+_TOOL_RANDOM_CHUNKS_BLOCK_SIZE: int = 1_000
+_TOOL_RANDOM_CHUNKS_MIN_MAX_CHARS: int = 3_000
+_TOOL_SUMMARY_MODE_INTERNAL_MAX_CHARS: int = 34_000
+_TOOL_SUMMARY_MODE_TARGET_LENGTH: int = 6_000
+_TOOL_SUMMARY_MIN_VALID_LENGTH: int = 100
+
+DEFAULT_SUMMARY_PROMPT_TEMPLATE: str = (
+    "Provide a concise summary of the website text below, capturing the "
+    "main points and all the key information. The summary should be up to "
+    f"{_TOOL_SUMMARY_MODE_TARGET_LENGTH} characters long. "
+    "Text to summarize:\n\n"
+)
+
+DEFAULT_HEADERS: Dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+        "image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.9"
+    ),
+    "Accept-Language": "*",
+    "Referer": "https://www.google.com/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 class VersatileScrapeWebsiteToolSchema(BaseModel):
-    """Input for VersatileScrapeWebsiteTool."""
+    """Input schema for VersatileScrapeWebsiteTool's run method."""
 
-    website_url: Optional[str] = Field(
-        default=None,
-        description=(
-            "Mandatory website canonical URL to scrape."
-        ),
+    website_url: str = Field(
+        description=("Mandatory URL of the website to scrape for this run."),
     )
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
+
+
+class VersatileScraperToolOutput(BaseModel):
+    """Standardized output for the VersatileScrapeWebsiteTool."""
+
+    scraped_content: Optional[str] = Field(
+        default=None,
+        description="The scraped or summarized content from the website.",
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description="An error message if the scraping process failed.",
+    )
+    source_url: str = Field(
+        description="The URL from which the content was scraped or attempted."
+    )
+    retrieval_mode_used: Literal[
+        "full", "head", "random_chunks", "summarize"
+    ] = Field(
+        description="The retrieval mode used for this scraping operation."
+    )
+    model_config = ConfigDict(extra="forbid")
+
+    def to_llm_response(self) -> str:
+        """Converts the output to a JSON string for the LLM."""
+        return self.model_dump_json(exclude_none=True, indent=2)
 
 
 class VersatileScrapeWebsiteTool(BaseTool):
-    name: str = "Website Scraping Tool"
-    description: str = (
-        "Scrapes website content with various strategies like full text, head "
-        "truncation, random chunks, or summarization."
+    """
+    A versatile tool to scrape website content using various strategies.
+    The tool's behavior (like retrieval mode) is configured
+    during its initialization. A URL must be provided at runtime.
+    """
+
+    name: str = "Versatile Website Scraper"
+    description: str = (  # This will be dynamically updated
+        "Scrapes website content. Specific behavior depends on "
+        "initialization. A URL must be provided by the agent at runtime."
     )
     args_schema: Type[BaseModel] = VersatileScrapeWebsiteToolSchema
 
-    default_website_url: Optional[str] = None
-    default_retrieval_mode: Literal[
-        "full", "head", "random_chunks", "summarize"
-    ] = "full"
-    default_max_chars: Optional[int] = None
-    default_llm: Optional[BaseLLM] = None
-    cookies: Optional[Dict[str, str]] = None
-    headers: Dict[str, str] = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
-            "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
-    _RANDOM_CHUNKS_BLOCK_SIZE: int = 1000
-    _RANDOM_CHUNKS_MIN_MAX_CHARS: int = 3000
-    _SUMMARY_MODE_INTERNAL_MAX_CHARS: int = 34000
-    _SUMMARY_MODE_TARGET_LENGTH: int = 6000
-    _SUMMARY_PROMPT_TEMPLATE: str = (
-        "Provide a concise summary of the following website text, capturing "
-        "the main points and key information. The summary should be up to "
-        "{target_chars} characters long.\n\nText:\n{context}\n\nSummary:"
+    retrieval_mode: Literal["full", "head", "random_chunks", "summarize"] = (
+        Field(default="full", description="Strategy for retrieving content.")
     )
-    _SUMMARY_MIN_VALID_LENGTH: int = 100
+    max_chars: Optional[int] = Field(
+        default=None,
+        description=(
+            "Max characters for 'head' or 'random_chunks' modes. "
+            "Also influences input limit for 'summarize' mode context."
+        ),
+    )
+    llm: Optional[BaseLLM] = Field(
+        default=None, description="crewai.LLM instance for 'summarize' mode."
+    )
+    cookies_config: Optional[Dict[str, str]] = Field(
+        default=None, description="Cookies dictionary for HTTP requests."
+    )
+    request_headers: Dict[str, str] = Field(
+        default_factory=lambda: DEFAULT_HEADERS.copy(),
+        description="HTTP headers for scraping requests.",
+    )
+    summary_prompt_template: str = Field(
+        default=DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+        description=(
+            "Prompt template for 'summarize' mode. The text to be "
+            "summarized will be appended to this prompt."
+        ),
+    )
 
-    def __init__(
+    _resolved_cookies: Optional[Dict[str, str]] = PrivateAttr(default=None)
+    _eff_max_chars_for_retrieval: Optional[int] = PrivateAttr(default=None)
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def _init_tool_and_dynamic_description(
         self,
-        website_url: Optional[str] = None,
-        retrieval_mode: Optional[
-            Literal["full", "head", "random_chunks", "summarize"]
-        ] = None,
-        max_chars: Optional[int] = None,
-        llm: Optional[BaseLLM] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
+    ) -> "VersatileScrapeWebsiteTool":
+        """
+        Validates configuration, resolves internal settings, and
+        dynamically builds the tool's description for the LLM.
+        """
+        if self.cookies_config:
+            self._resolved_cookies = self.cookies_config
 
-        if name is not None:
-            self.name = name
-        if description is not None:
-            self.description = description
-
-        if website_url is not None:
-            self.default_website_url = website_url
-        if retrieval_mode is not None:
-            self.default_retrieval_mode = retrieval_mode
-        if max_chars is not None:
-            self.default_max_chars = max_chars
-        if llm is not None:
-            self.default_llm = llm
-
-        if headers is not None:
-            self.headers = headers
-
-        if cookies is not None:
-            if (
-                "name" in cookies
-                and "value" in cookies
-                and isinstance(cookies["name"], str)
-                and isinstance(cookies["value"], str)
-            ):
-                cookie_name = cookies["name"]
-                env_var_name = cookies["value"]
-                cookie_value = os.getenv(env_var_name)
-                if cookie_value:
-                    self.cookies = {cookie_name: cookie_value}
-                else:
-                    # For now, silently ignore if env var not found
-                    pass
-            elif isinstance(cookies, dict):  # Direct cookies
-                self.cookies = cookies
-
-        # Start with the base description (either default or provided)
-        base_desc = self.description
-
-        desc_details_list = []
-        if self.default_website_url:
-            desc_details_list.append(
-                f"Default website: '{self.default_website_url}'."
+        if self.retrieval_mode == "summarize":
+            if not self.llm:
+                raise ValueError(
+                    "LLM instance ('llm') is required for 'summarize' mode."
+                )
+            context_limit = (
+                self.max_chars
+                if self.max_chars is not None
+                else _TOOL_SUMMARY_MODE_INTERNAL_MAX_CHARS
+            )
+            self._eff_max_chars_for_retrieval = max(
+                context_limit, _TOOL_RANDOM_CHUNKS_MIN_MAX_CHARS
+            )
+        elif self.retrieval_mode == "head":
+            if self.max_chars is None:
+                raise ValueError("'max_chars' is required for 'head' mode.")
+            self._eff_max_chars_for_retrieval = self.max_chars
+        elif self.retrieval_mode == "random_chunks":
+            if self.max_chars is None:
+                raise ValueError(
+                    "'max_chars' is required for 'random_chunks' mode."
+                )
+            self._eff_max_chars_for_retrieval = max(
+                self.max_chars, _TOOL_RANDOM_CHUNKS_MIN_MAX_CHARS
             )
 
-        desc_details_list.append(
-            f"Configured retrieval mode: '{self.default_retrieval_mode}'."
+        base_desc = (
+            f"Scrapes content from a website using the "
+            f"'{self.retrieval_mode}' strategy. A specific URL must always "
+            "be provided by the agent when running this tool."
         )
-
+        details = []
         if (
-            self.default_retrieval_mode in ["head", "random_chunks"]
-            and self.default_max_chars is not None
+            self.retrieval_mode in ["head", "random_chunks"]
+            and self._eff_max_chars_for_retrieval is not None
         ):
-            desc_details_list.append(
-                f"Configured 'max_chars': {self.default_max_chars}."
+            details.append(
+                f"It's configured to process up to "
+                f"{self._eff_max_chars_for_retrieval} characters from the "
+                "runtime-provided URL."
             )
-        elif self.default_retrieval_mode in ["head", "random_chunks"]:
-             desc_details_list.append(
-                f"Warning: Mode '{self.default_retrieval_mode}' selected but "
-                "'max_chars' was not set during initialization."
+        elif (
+            self.retrieval_mode == "summarize"
+            and self._eff_max_chars_for_retrieval is not None
+        ):
+            details.append(
+                f"It will process up to {self._eff_max_chars_for_retrieval} "
+                f"characters of website content (from runtime URL) before "
+                f"summarizing. The final summary aims for approx. "
+                f"{_TOOL_SUMMARY_MODE_TARGET_LENGTH} characters."
             )
 
-
-        if self.default_retrieval_mode == "summarize":
-            if self.default_llm:
-                desc_details_list.append(
-                    "Configured for summarization with a provided LLM."
-                )
+        if self.retrieval_mode == "summarize":
+            if self.summary_prompt_template == DEFAULT_SUMMARY_PROMPT_TEMPLATE:
+                details.append("Uses a default summarization prompt.")
             else:
-                desc_details_list.append(
-                    "Warning: Mode 'summarize' selected but 'llm' was not "
-                    "provided during initialization."
-                )
+                details.append("Uses a custom summarization prompt.")
 
-        desc_suffix = ""
-        if desc_details_list:
-            desc_suffix = " " + " ".join(desc_details_list)
-
-        # Set the final description including details
-        self.description = f"{base_desc}{desc_suffix}"
+        self.description = base_desc
+        if details:
+            self.description += " " + " ".join(details)
+        return self
 
     def _run(
         self,
-        website_url: Optional[str] = None,
+        website_url: str,
     ) -> str:
-        eff_url = (
-            website_url
-            if website_url is not None
-            else self.default_website_url
-        )
-        if eff_url is None:
-            raise ValueError(
-                "Website canonical URL is required."
+        """
+        Executes the scraping process based on initialized configuration
+        and the mandatory runtime website_url.
+        Returns a JSON string of VersatileScraperToolOutput.
+        """
+        if not website_url.strip():  # Check for empty or whitespace-only URL
+            output = VersatileScraperToolOutput(
+                error_message="A non-empty website URL must be provided.",
+                source_url=website_url or "Invalid (empty URL provided)",
+                retrieval_mode_used=self.retrieval_mode,
             )
-
-        # Use the retrieval mode, max_chars, and llm set during initialization
-        eff_mode = self.default_retrieval_mode
-        eff_mc = self.default_max_chars
-        current_llm = self.default_llm
-
-        # Validate parameters based on the initialized mode
-        if eff_mode == "head" and eff_mc is None:
-            raise ValueError(
-                "'max_chars' must be set during initialization for 'head' mode."
-            )
-        if eff_mode == "random_chunks":
-            if eff_mc is None:
-                raise ValueError(
-                    "'max_chars' must be set during initialization for "
-                    "'random_chunks' mode."
-                )
-            # Ensure minimum max_chars for random_chunks internally
-            eff_mc = max(eff_mc, self._RANDOM_CHUNKS_MIN_MAX_CHARS)
-        if eff_mode == "summarize" and not isinstance(current_llm, BaseLLM):
-            raise ValueError(
-                "A valid LLM instance must be provided during initialization "
-                "for 'summarize' mode."
-            )
+            return output.to_llm_response()
 
         try:
             page = requests.get(
-                eff_url,
+                website_url,
                 timeout=15,
-                headers=self.headers,
-                cookies=self.cookies if self.cookies else {},
+                headers=self.request_headers,
+                cookies=self._resolved_cookies or {},
             )
             page.raise_for_status()
-            page.encoding = page.apparent_encoding  # Better encoding detection
+            page.encoding = page.apparent_encoding
             parsed = BeautifulSoup(page.text, "html.parser")
 
             text_content = parsed.get_text(" ")
             text_content = re.sub(r"[ \t]+", " ", text_content)
-            text_content = re.sub(r"\s+\n\s+", "\n", text_content)
-            text_content = text_content.strip()
+            text_content = re.sub(r"\s*\n\s*", "\n", text_content).strip()
 
-            if not text_content:  # Empty content after cleaning
-                return "No text content found on the website after cleaning."
-
-            if eff_mode == "full":
-                return text_content
-
-            # Check size against max_chars for modes that use it
-            if eff_mode in ["head", "random_chunks"] and eff_mc is not None:
-                if len(text_content) <= eff_mc:
-                    return text_content  # Return full if under limit
-
-            if eff_mode == "head":
-                # eff_mc is guaranteed non-None here due to prior validation
-                return self._retrieve_head_content(text_content, eff_mc) # type: ignore
-            elif eff_mode == "random_chunks":
-                # eff_mc is guaranteed non-None here due to prior validation
-                return self._retrieve_random_chunks_content(text_content, eff_mc) # type: ignore
-            elif eff_mode == "summarize":
-                # current_llm is guaranteed valid BaseLLM here due to prior validation
-                return self._retrieve_summarized_content(
-                    text_content,
-                    current_llm,  # type: ignore
+            if not text_content:
+                output = VersatileScraperToolOutput(
+                    scraped_content="No text content found on the website "
+                    "after cleaning.",
+                    source_url=website_url,
+                    retrieval_mode_used=self.retrieval_mode,
                 )
-            else:
-                raise ValueError(f"Unknown retrieval mode '{eff_mode}'.")
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                f"Error scraping website {eff_url}: {str(e)}"
-            ) from e
-        except Exception as e:
-            raise RuntimeError(
-                f"An unexpected error occurred while processing {eff_url}: {str(e)}"
-            ) from e
+                return output.to_llm_response()
 
-    def _retrieve_head_content(self, full_content: str, max_chars: int) -> str:
+            content_to_return: str
+            if self.retrieval_mode == "full":
+                content_to_return = text_content
+            elif self.retrieval_mode == "head":
+                content_to_return = self._retrieve_head_content(
+                    text_content, self._eff_max_chars_for_retrieval  # type: ignore
+                )
+            elif self.retrieval_mode == "random_chunks":
+                content_to_return = self._retrieve_random_chunks_content(
+                    text_content, self._eff_max_chars_for_retrieval  # type: ignore
+                )
+            elif self.retrieval_mode == "summarize":
+                content_to_return = self._retrieve_summarized_content(
+                    text_content,
+                    self.llm,  # type: ignore
+                    self._eff_max_chars_for_retrieval,  # type: ignore
+                )
+            else:  # Should be unreachable due to Pydantic validation
+                raise AssertionError(
+                    f"Invalid retrieval mode: {self.retrieval_mode}"
+                )
+
+            output = VersatileScraperToolOutput(
+                scraped_content=content_to_return,
+                source_url=website_url,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+            return output.to_llm_response()
+        except requests.exceptions.RequestException as e:
+            output = VersatileScraperToolOutput(
+                error_message=f"HTTP error scraping {website_url}: {e}",
+                source_url=website_url,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+        except ValueError as e:  # For issues like failed summary
+            output = VersatileScraperToolOutput(
+                error_message=f"Processing error for {website_url}: {e}",
+                source_url=website_url,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+        except Exception as e:  # Catch-all for unexpected errors
+            output = VersatileScraperToolOutput(
+                error_message=f"Unexpected error processing {website_url}: {e}",
+                source_url=website_url,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+        return output.to_llm_response()
+
+    def _retrieve_head_content(
+        self,
+        full_content: str,
+        max_chars: int
+    ) -> str:
+        if len(full_content) <= max_chars:
+            return full_content
         return full_content[:max_chars]
 
     def _retrieve_random_chunks_content(
-        self, full_content: str, max_chars: int
+        self,
+        full_content: str,
+        eff_max_chars: int
     ) -> str:
         if not full_content:
             return ""
+        if len(full_content) <= eff_max_chars:
+            return full_content  # Already within limit
 
-        block_size = self._RANDOM_CHUNKS_BLOCK_SIZE
-        num_blocks_to_select = math.floor(max_chars / block_size)
+        block_size = _TOOL_RANDOM_CHUNKS_BLOCK_SIZE
+        num_blocks_select = math.floor(eff_max_chars / block_size)
+        if num_blocks_select == 0 and eff_max_chars > 0:
+            num_blocks_select = 1  # Ensure at least one block selected
 
         all_blocks = [
             full_content[i : i + block_size]
@@ -267,73 +321,74 @@ class VersatileScrapeWebsiteTool(BaseTool):
         if not all_blocks:
             return ""
 
-        if len(all_blocks) <= num_blocks_to_select:
-            return "...".join(all_blocks) + (
-                "..." if len(all_blocks) > 0 else ""
-            )
+        if len(all_blocks) <= num_blocks_select:
+            # Not enough blocks to warrant complex selection, join and truncate
+            return ("...".join(all_blocks))[:eff_max_chars]
 
         selected_indices: Set[int] = set()
-        selected_indices.add(0)
+        if num_blocks_select > 0:
+            selected_indices.add(0)  # First block
+        if num_blocks_select > 1 and len(all_blocks) > 1:
+            # Add last block if distinct from first
+            if (len(all_blocks) - 1) != 0:
+                selected_indices.add(len(all_blocks) - 1)
 
-        if num_blocks_to_select > 1 and len(all_blocks) > 1:
-            selected_indices.add(len(all_blocks) - 1)
+        needed_middle = num_blocks_select - len(selected_indices)
+        # Potential middle blocks
+        middle_indices = [i for i in range(1, len(all_blocks) - 1)]
 
-        needed_middle_blocks = num_blocks_to_select - len(selected_indices)
+        if needed_middle > 0 and middle_indices:
+            random.shuffle(middle_indices)
+            for i in range(min(needed_middle, len(middle_indices))):
+                selected_indices.add(middle_indices[i])
 
-        middle_block_indices = [i for i in range(1, len(all_blocks) - 1)]
+        result_parts = [all_blocks[i] for i in sorted(list(selected_indices))]
 
-        if needed_middle_blocks > 0 and middle_block_indices:
-            random.shuffle(middle_block_indices)
-            for i in range(
-                min(needed_middle_blocks, len(middle_block_indices))
-            ):
-                selected_indices.add(middle_block_indices[i])
+        final_str = "...".join(result_parts)
+        # Add ellipsis if content was indeed truncated by selection
+        if len(all_blocks) > num_blocks_select and num_blocks_select > 0:
+            final_str += "..."
 
-        result_parts: List[str] = []
-        for block_idx in sorted(list(selected_indices)):
-            result_parts.append(all_blocks[block_idx])
-
-        return "...".join(result_parts) + (
-            "..."
-            if len(result_parts) > 1 and len(all_blocks) > num_blocks_to_select
-            else ""
-        )
+        return final_str[:eff_max_chars]
 
     def _retrieve_summarized_content(
-        self, full_content: str, llm: BaseLLM
+        self, full_content: str,
+        llm: BaseLLM,
+        context_chars_limit: int
     ) -> str:
-        context_max_chars = self.default_max_chars if self.default_max_chars is not None else self._SUMMARY_MODE_INTERNAL_MAX_CHARS
-        # Ensure it meets the minimum for random_chunks if using default_max_chars
-        if self.default_max_chars is not None:
-            context_max_chars = max(context_max_chars, self._RANDOM_CHUNKS_MIN_MAX_CHARS)
-
-        context_for_summary = self._retrieve_random_chunks_content(
-            full_content, context_max_chars
+        context = self._retrieve_random_chunks_content(
+            full_content, context_chars_limit
         )
-        if not context_for_summary.strip():
+        if not context.strip():
             raise ValueError("No content extracted from website to summarize.")
 
-        prompt = self._SUMMARY_PROMPT_TEMPLATE.format(
-            context=context_for_summary,
-            target_chars=self._SUMMARY_MODE_TARGET_LENGTH,
-        )
+        prompt = self.summary_prompt_template + "\n" + context
+        raw_summary = ""
+        last_exc: Optional[Exception] = None
 
-        last_exception: Optional[Exception] = None
-        for attempt in range(3):
+        for _ in range(3):  # Up to 3 attempts
             try:
-                raw_summary = llm.call(prompt)
-                if isinstance(raw_summary, str):
-                    summary = raw_summary.strip()
-                    if len(summary) >= self._SUMMARY_MIN_VALID_LENGTH:
-                        return summary[: self._SUMMARY_MODE_TARGET_LENGTH]
-            except Exception as e:
-                last_exception = e
-                if attempt == 2:
-                    raise RuntimeError(
-                        "LLM call failed after 3 attempts."
-                    ) from last_exception
+                llm_response = llm.call(prompt)
 
-        raise ValueError(
-            "LLM failed to generate a valid summary after 3 attempts "
-            "(e.g., summary too short or non-string response)."
+                if isinstance(llm_response, str):
+                    summary = llm_response.strip()
+
+                    if len(summary) >= _TOOL_SUMMARY_MIN_VALID_LENGTH:
+                        return summary[:_TOOL_SUMMARY_MODE_TARGET_LENGTH]
+                    else:
+                        raw_summary = summary  # Store if too short
+                else:  # Non-string response
+                    raw_summary = str(llm_response)
+            except Exception as e:
+                last_exc = e
+
+        # All attempts failed
+        error_msg = (
+            "LLM failed to generate a valid summary after 3 attempts. "
+            f"Last raw output (truncated): '{raw_summary[:200]}...'"
         )
+        if last_exc:
+            error_msg += (
+                f" Last exception: {type(last_exc).__name__} - {str(last_exc)}"
+            )
+        raise ValueError(error_msg)
