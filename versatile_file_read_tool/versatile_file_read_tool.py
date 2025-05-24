@@ -1,249 +1,356 @@
 import math
 import random
-from typing import Any, List, Literal, Optional, Set, Type
+from typing import List, Literal, Optional, Set, Type
 
 from crewai.llms.base_llm import BaseLLM
 from crewai.tools.base_tool import BaseTool
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    model_validator,
+)
+
+_TOOL_FILE_RANDOM_CHUNKS_BLOCK_SIZE: int = 1_000
+_TOOL_FILE_RANDOM_CHUNKS_MIN_MAX_CHARS: int = 3_000
+_TOOL_FILE_SUMMARY_MODE_INTERNAL_MAX_CHARS: int = 34_000
+_TOOL_FILE_SUMMARY_MODE_TARGET_LENGTH: int = 6_000
+_TOOL_FILE_SUMMARY_MIN_VALID_LENGTH: int = 100
+
+DEFAULT_FILE_SUMMARY_PROMPT_TEMPLATE: str = (
+    "Provide a concise summary of the file content below, capturing the "
+    "main points and all key information. The summary should be up to "
+    f"{_TOOL_FILE_SUMMARY_MODE_TARGET_LENGTH} characters long.\n\n"
+    "File content to summarize:\n\n"
+)
 
 
 class VersatileFileReadToolSchema(BaseModel):
-    """Input for VersatileFileReadTool."""
+    """Input schema for VersatileFileReadTool's run method."""
 
     file_path: Optional[str] = Field(
         default=None,
-        description=("Mandatory full path to the file to read."),
+        description="Optional full path to the file to read for this run. "
+        "If not provided, the tool's default file path (if configured) "
+        "will be used.",
     )
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+
+class VersatileFileReadToolOutput(BaseModel):
+    """Standardized output for the VersatileFileReadTool."""
+
+    read_content: Optional[str] = Field(
+        default=None,
+        description="The read or summarized content from the file.",
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description="An error message if the file reading process failed.",
+    )
+    source_file_path: str = Field(
+        description="The file path from which content was read or attempted."
+    )
+    retrieval_mode_used: Literal[
+        "full", "head", "random_chunks", "summarize"
+    ] = Field(description="The retrieval mode used for this file operation.")
+    model_config = ConfigDict(extra="forbid")
+
+    def to_llm_response(self) -> str:
+        """Converts the output to a JSON string for the LLM."""
+        return self.model_dump_json(exclude_none=True, indent=2)
 
 
 class VersatileFileReadTool(BaseTool):
-    name: str = "File Reading Tool"
-    description: str = (
-        "Reads file content with various strategies like full read, head "
-        "truncation, random chunks, or summarization."
+    """
+    A versatile tool to read file content using various strategies.
+    The tool's behavior (like retrieval mode and default file path) is
+    configured during its initialization. A file path can also be
+    provided at runtime.
+    """
+
+    name: str = "Versatile File Reader"
+    description: str = (  # This will be dynamically updated
+        "Reads file content. Specific behavior depends on "
+        "initialization. A file path can be provided by the agent at runtime "
+        "to override any default."
     )
     args_schema: Type[BaseModel] = VersatileFileReadToolSchema
 
-    default_file_path: Optional[str] = None
-    default_retrieval_mode: Literal[
-        "full", "head", "random_chunks", "summarize"
-    ] = "full"
-    default_start_line: int = 1
-    default_line_count: Optional[int] = None
-    default_max_chars: Optional[int] = None
-    default_llm: Optional[BaseLLM] = None
-
-    _RANDOM_CHUNKS_BLOCK_SIZE: int = 1000
-    _RANDOM_CHUNKS_MIN_MAX_CHARS: int = 3000
-    _SUMMARY_MODE_INTERNAL_MAX_CHARS: int = 34000
-    _SUMMARY_MODE_TARGET_LENGTH: int = 6000
-    _SUMMARY_PROMPT_TEMPLATE: str = (
-        "Provide a concise summary of the following text, capturing the "
-        "main points and key information. The summary should be up to "
-        "{target_chars} characters long.\n\nText:\n{context}\n\nSummary:"
+    file_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Default full path to the file to read if not "
+            "provided at runtime."
+        ),
     )
-    _SUMMARY_MIN_VALID_LENGTH: int = 100
+    retrieval_mode: Literal["full", "head", "random_chunks", "summarize"] = (
+        Field(default="full", description="Strategy for retrieving content.")
+    )
+    start_line: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Line number to start reading from (1-indexed). "
+            "Applicable for 'full' mode."
+        ),
+    )
+    line_count: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Number of lines to read. Applicable for 'full' mode. "
+            "None means read to end of file."
+        ),
+    )
+    max_chars: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Max characters for 'head' or 'random_chunks' modes. "
+            "Also influences input limit for 'summarize' mode context."
+        ),
+    )
+    llm: Optional[BaseLLM] = Field(
+        default=None, description="crewai.LLM instance for 'summarize' mode."
+    )
+    summary_prompt_template: str = Field(
+        default=DEFAULT_FILE_SUMMARY_PROMPT_TEMPLATE,
+        description=(
+            "Prompt template for 'summarize' mode. The file content to be "
+            "summarized will be appended to this prompt."
+        ),
+    )
 
-    def __init__(
+    _eff_max_chars_for_retrieval: Optional[int] = PrivateAttr(default=None)
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def _init_tool_and_dynamic_description(
         self,
-        file_path: Optional[str] = None,
-        retrieval_mode: Optional[
-            Literal["full", "head", "random_chunks", "summarize"]
-        ] = None,
-        start_line: Optional[int] = None,
-        line_count: Optional[int] = None,
-        max_chars: Optional[int] = None,
-        llm: Optional[BaseLLM] = None,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
-
-        if name is not None:
-            self.name = name
-        if description is not None:
-            self.description = description
-
-        # Store initialization parameters as defaults
-        if file_path is not None:
-            self.default_file_path = file_path
-        if retrieval_mode is not None:
-            self.default_retrieval_mode = retrieval_mode
-        if start_line is not None:
-            # Ensure start_line is at least 1
-            self.default_start_line = max(start_line, 1)
-
-        # line_count can be None or positive int
-        self.default_line_count = line_count
-        if self.default_line_count is not None:
-            self.default_line_count = max(self.default_line_count, 1)
-
-        if max_chars is not None:
-            self.default_max_chars = max_chars
-        if llm is not None:
-            self.default_llm = llm
-
-        base_desc = self.description
-
-        desc_details_list = []
-        if self.default_file_path:
-            desc_details_list.append(
-                f"Default file: '{self.default_file_path}'."
+    ) -> "VersatileFileReadTool":
+        """
+        Validates configuration, resolves internal settings, and
+        dynamically builds the tool's description for the LLM.
+        """
+        if self.retrieval_mode == "summarize":
+            if not self.llm:
+                raise ValueError(
+                    "LLM instance ('llm') is required for 'summarize' mode."
+                )
+            context_limit = (
+                self.max_chars
+                if self.max_chars is not None
+                else _TOOL_FILE_SUMMARY_MODE_INTERNAL_MAX_CHARS
+            )
+            self._eff_max_chars_for_retrieval = max(
+                context_limit, _TOOL_FILE_RANDOM_CHUNKS_MIN_MAX_CHARS
+            )
+        elif self.retrieval_mode == "head":
+            if self.max_chars is None:
+                raise ValueError("'max_chars' is required for 'head' mode.")
+            self._eff_max_chars_for_retrieval = self.max_chars
+        elif self.retrieval_mode == "random_chunks":
+            if self.max_chars is None:
+                raise ValueError(
+                    "'max_chars' is required for 'random_chunks' mode."
+                )
+            self._eff_max_chars_for_retrieval = max(
+                self.max_chars, _TOOL_FILE_RANDOM_CHUNKS_MIN_MAX_CHARS
             )
 
-        desc_details_list.append(
-            f"Configured retrieval mode: '{self.default_retrieval_mode}'."
+        base_desc_intro = (
+            f"Reads content from a file using the '{self.retrieval_mode}' "
+            "strategy."
         )
+        details = []
 
-        if self.default_retrieval_mode == "full":
-            line_desc = f"Starts reading at line {self.default_start_line}."
-            if self.default_line_count is not None:
-                line_desc += f" Reads up to {self.default_line_count} lines."
+        if self.file_path:
+            details.append(
+                f"Default file path configured: '{self.file_path}'. "
+                "A different path can be provided at runtime."
+            )
+        else:
+            details.append(
+                "No default file path configured; a file path must be "
+                "provided at runtime."
+            )
+
+        if self.retrieval_mode == "full":
+            line_desc = "For 'full' mode: starts reading at line "
+            line_desc += f"{self.start_line}."
+            if self.line_count is not None:
+                line_desc += f" Reads up to {self.line_count} lines."
             else:
                 line_desc += " Reads until the end of the file."
-            desc_details_list.append(line_desc)
+            details.append(line_desc)
 
         if (
-            self.default_retrieval_mode in ["head", "random_chunks"]
-            and self.default_max_chars is not None
+            self.retrieval_mode in ["head", "random_chunks"]
+            and self._eff_max_chars_for_retrieval is not None
         ):
-            desc_details_list.append(
-                f"Configured 'max_chars': {self.default_max_chars}."
+            details.append(
+                f"It's configured to process up to "
+                f"{self._eff_max_chars_for_retrieval} characters."
             )
-        elif self.default_retrieval_mode in ["head", "random_chunks"]:
-            desc_details_list.append(
-                f"Warning: Mode '{self.default_retrieval_mode}' selected but "
-                "'max_chars' was not set during initialization."
+        elif (
+            self.retrieval_mode == "summarize"
+            and self._eff_max_chars_for_retrieval is not None
+        ):
+            details.append(
+                f"For 'summarize' mode: it will process up to "
+                f"{self._eff_max_chars_for_retrieval} characters of file "
+                f"content before summarizing. The final summary aims for "
+                f"approx. {_TOOL_FILE_SUMMARY_MODE_TARGET_LENGTH} characters."
             )
 
-        if self.default_retrieval_mode == "summarize":
-            if self.default_llm:
-                desc_details_list.append(
-                    "Configured for summarization with a provided LLM."
-                )
+        if self.retrieval_mode == "summarize":
+            if (
+                self.summary_prompt_template
+                == DEFAULT_FILE_SUMMARY_PROMPT_TEMPLATE
+            ):
+                details.append("Uses a default summarization prompt.")
             else:
-                desc_details_list.append(
-                    "Warning: Mode 'summarize' selected but 'llm' was not "
-                    "provided during initialization."
-                )
+                details.append("Uses a custom summarization prompt.")
 
-        desc_suffix = ""
-        if desc_details_list:
-            desc_suffix = " " + " ".join(desc_details_list)
-
-        # Set the final description including details
-        self.description = f"{base_desc}{desc_suffix}"
+        self.description = base_desc_intro
+        if details:
+            self.description += " " + " ".join(details)
+        return self
 
     def _run(
         self,
         file_path: Optional[str] = None,
     ) -> str:
-        eff_fp = file_path if file_path is not None else self.default_file_path
-        if eff_fp is None:
-            raise ValueError(
-                "File path is required."
-            )
+        """
+        Executes the file reading process. Uses runtime file_path if
+        provided, otherwise falls back to file_path (if set).
+        Returns a JSON string of VersatileFileReadToolOutput.
+        """
+        eff_fp_candidate = (
+            file_path if file_path is not None else self.file_path
+        )
 
-        # Use the parameters set during initialization
-        eff_mode = self.default_retrieval_mode
-        eff_sl = self.default_start_line
-        eff_lc = self.default_line_count
-        eff_mc = self.default_max_chars
-        current_llm = self.default_llm
+        if eff_fp_candidate is None or not eff_fp_candidate.strip():
+            output = VersatileFileReadToolOutput(
+                error_message="A file path must be provided either during tool "
+                "initialization (as file_path) or at runtime.",
+                source_file_path=eff_fp_candidate or "No file path provided",
+                retrieval_mode_used=self.retrieval_mode,
+            )
+            return output.to_llm_response()
 
-        # Validate parameters based on the initialized mode
-        if eff_mode == "head" and eff_mc is None:
-            raise ValueError(
-                "'max_chars' must be set during initialization for 'head' mode."
-            )
-        if eff_mode == "random_chunks":
-            if eff_mc is None:
-                raise ValueError(
-                    "'max_chars' must be set during initialization for "
-                    "'random_chunks' mode."
-                )
-            # Ensure minimum max_chars for random_chunks internally
-            eff_mc = max(eff_mc, self._RANDOM_CHUNKS_MIN_MAX_CHARS)
-        if eff_mode == "summarize" and not isinstance(current_llm, BaseLLM):
-            raise ValueError(
-                "A valid LLM instance must be provided during initialization "
-                "for 'summarize' mode."
-            )
+        # Ensure eff_fp is a non-empty string after this check
+        eff_fp = eff_fp_candidate.strip()
 
         try:
-            # Read full content only if needed (for head, random_chunks, summarize)
-            full_content: Optional[str] = None
-            if eff_mode != "full":
+            content_to_return: str
+            full_content_for_processing: Optional[str] = None
+
+            if self.retrieval_mode != "full":
                 with open(eff_fp, "r", encoding="utf-8", errors="ignore") as f:
-                    full_content = f.read()
+                    full_content_for_processing = f.read()
 
-                # If content is smaller than limit, return full content directly
                 if (
-                    eff_mode in ["head", "random_chunks"]
-                    and eff_mc
-                    is not None  # eff_mc is guaranteed non-None here
+                    self.retrieval_mode in ["head", "random_chunks"]
+                    and self._eff_max_chars_for_retrieval is not None
+                    and len(full_content_for_processing)
+                    <= self._eff_max_chars_for_retrieval
                 ):
-                    if len(full_content) <= eff_mc:
-                        return full_content
+                    output = VersatileFileReadToolOutput(
+                        read_content=full_content_for_processing,
+                        source_file_path=eff_fp,
+                        retrieval_mode_used=self.retrieval_mode,
+                    )
+                    return output.to_llm_response()
 
-            if eff_mode == "full":
-                # Pass initialized line parameters
-                return self._retrieve_full_content(eff_fp, eff_sl, eff_lc)
-
-            # Ensure full_content was loaded for non-'full' modes
-            if full_content is None:
-                # This should ideally not happen if logic above is correct
-                raise RuntimeError(
-                    "Internal error: file content not loaded for processing "
-                    f"in mode '{eff_mode}'."
+            if self.retrieval_mode == "full":
+                content_to_return = self._retrieve_full_content(
+                    eff_fp, self.start_line, self.line_count
                 )
-
-            if eff_mode == "head":
-                # eff_mc is guaranteed non-None here due to prior validation
-                return self._retrieve_head_content(full_content, eff_mc)  # type: ignore
-            elif eff_mode == "random_chunks":
-                # eff_mc is guaranteed non-None and adjusted here
-                return self._retrieve_random_chunks_content(full_content, eff_mc)  # type: ignore
-            elif eff_mode == "summarize":
-                # current_llm is guaranteed valid BaseLLM here
-                return self._retrieve_summarized_content(
-                    full_content,
-                    current_llm,  # type: ignore
+            elif self.retrieval_mode == "head":
+                if full_content_for_processing is None:
+                    raise AssertionError(
+                        "Internal: content not loaded for head."
+                    )
+                content_to_return = self._retrieve_head_content(
+                    full_content_for_processing,
+                    self._eff_max_chars_for_retrieval,  # type: ignore
+                )
+            elif self.retrieval_mode == "random_chunks":
+                if full_content_for_processing is None:
+                    raise AssertionError(
+                        "Internal: content not loaded for chunks."
+                    )
+                content_to_return = self._retrieve_random_chunks_content(
+                    full_content_for_processing,
+                    self._eff_max_chars_for_retrieval,  # type: ignore
+                )
+            elif self.retrieval_mode == "summarize":
+                if full_content_for_processing is None:
+                    raise AssertionError(
+                        "Internal: content not loaded for summary."
+                    )
+                content_to_return = self._retrieve_summarized_content(
+                    full_content_for_processing,
                 )
             else:
-                raise ValueError(f"Unknown retrieval mode '{eff_mode}'.")
+                raise AssertionError(
+                    f"Invalid retrieval mode: {self.retrieval_mode}"
+                )
+
+            output = VersatileFileReadToolOutput(
+                read_content=content_to_return,
+                source_file_path=eff_fp,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+            return output.to_llm_response()
         except FileNotFoundError:
-            raise FileNotFoundError(f"File not found at path: {eff_fp}")
+            output = VersatileFileReadToolOutput(
+                error_message=f"File not found at path: {eff_fp}",
+                source_file_path=eff_fp,
+                retrieval_mode_used=self.retrieval_mode,
+            )
         except PermissionError:
-            raise PermissionError(f"Permission denied for file: {eff_fp}")
-        except (
-            ValueError
-        ) as ve:  # Catch specific ValueErrors from _retrieve_full_content
-            raise ve
+            output = VersatileFileReadToolOutput(
+                error_message=f"Permission denied for file: {eff_fp}",
+                source_file_path=eff_fp,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+        except ValueError as ve:
+            output = VersatileFileReadToolOutput(
+                error_message=f"Processing error for {eff_fp}: {ve}",
+                source_file_path=eff_fp,
+                retrieval_mode_used=self.retrieval_mode,
+            )
         except Exception as e:
-            # Catch-all for other unexpected errors
-            raise RuntimeError(
-                f"An unexpected error occurred while processing file {eff_fp} "
-                f"in mode '{eff_mode}': {str(e)}"
-            ) from e
+            output = VersatileFileReadToolOutput(
+                error_message=f"Unexpected error processing {eff_fp}: {e}",
+                source_file_path=eff_fp,
+                retrieval_mode_used=self.retrieval_mode,
+            )
+        return output.to_llm_response()
 
     def _retrieve_full_content(
-        self, file_path: str, start_line: int, line_count: Optional[int]
+        self,
+        file_path: str,
+        start_line: int,
+        line_count: Optional[int]
     ) -> str:
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                # Read all if no line constraints
+            # Handle encoding mismatches gracefully by replacing invalid characters
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 if start_line == 1 and line_count is None:
                     return f.read()
 
-                start_idx = max(start_line - 1, 0)
+                start_idx = start_line - 1
                 lines_buffer: List[str] = []
-                line_num = 0  # Keep track of actual line number read
+                current_line_num = 0
 
                 for i, line_text in enumerate(f):
-                    line_num = i + 1  # Current line number (1-based)
+                    current_line_num = i + 1
                     if i >= start_idx:
                         if (
                             line_count is None
@@ -251,43 +358,59 @@ class VersatileFileReadTool(BaseTool):
                         ):
                             lines_buffer.append(line_text)
                         else:
-                            break  # Reached line_count limit
+                            break
 
-                # Check if start_line was beyond the actual number of lines
-                if not lines_buffer and start_line > line_num and line_num > 0:
+                if (
+                    not lines_buffer
+                    and start_line > current_line_num
+                    and current_line_num > 0
+                ):
                     raise ValueError(
                         f"Start line {start_line} exceeds the number of "
-                        f"lines ({line_num}) in the file."
+                        f"lines ({current_line_num}) in the file."
                     )
-                # Handle case where file is empty or start_line is 1 but file empty
-                if not lines_buffer and start_line > 0 and line_num == 0:
+                if (
+                    not lines_buffer
+                    and start_line > 0
+                    and current_line_num == 0
+                ):
                     if start_line == 1:
-                        return ""  # Empty file is valid for start_line 1
+                        return ""
                     else:
                         raise ValueError(
-                            "File is empty or start line is invalid."
+                            "File is empty and start line is greater than 1."
                         )
-
                 return "".join(lines_buffer)
-        except ValueError:  # Re-raise specific ValueError
+        except ValueError:
             raise
         except Exception as e:
-            # Wrap other potential IOErrors or unexpected issues
             raise RuntimeError(
                 f"Error reading lines from file {file_path}: {str(e)}"
             ) from e
 
-    def _retrieve_head_content(self, full_content: str, max_chars: int) -> str:
+    def _retrieve_head_content(
+        self,
+        full_content: str,
+        max_chars: int
+    ) -> str:
+        if len(full_content) <= max_chars:
+            return full_content
         return full_content[:max_chars]
 
     def _retrieve_random_chunks_content(
-        self, full_content: str, max_chars: int
+        self,
+        full_content: str,
+        eff_max_chars: int
     ) -> str:
         if not full_content:
             return ""
+        if len(full_content) <= eff_max_chars:
+            return full_content
 
-        block_size = self._RANDOM_CHUNKS_BLOCK_SIZE
-        num_blocks_to_select = math.floor(max_chars / block_size)
+        block_size = _TOOL_FILE_RANDOM_CHUNKS_BLOCK_SIZE
+        num_blocks_select = math.floor(eff_max_chars / block_size)
+        if num_blocks_select == 0 and eff_max_chars > 0:
+            num_blocks_select = 1
 
         all_blocks = [
             full_content[i : i + block_size]
@@ -296,92 +419,80 @@ class VersatileFileReadTool(BaseTool):
         if not all_blocks:
             return ""
 
-        # Total content fits within adjusted max_chars after chunking
-        if len(all_blocks) <= num_blocks_to_select:
-            return "".join(
-                all_blocks
-            )
+        if len(all_blocks) <= num_blocks_select:
+            return ("...".join(all_blocks))[:eff_max_chars]
 
         selected_indices: Set[int] = set()
-        selected_indices.add(0)  # Always include the first block
+        if num_blocks_select > 0:
+            selected_indices.add(0)
+        if num_blocks_select > 1 and len(all_blocks) > 1:
+            if (len(all_blocks) - 1) != 0:
+                selected_indices.add(len(all_blocks) - 1)
 
-        # Include the last block if we need more than one block and there is more than one
-        if num_blocks_to_select > 1 and len(all_blocks) > 1:
-            selected_indices.add(len(all_blocks) - 1)
+        needed_middle = num_blocks_select - len(selected_indices)
+        middle_indices = [i for i in range(1, len(all_blocks) - 1)]
 
-        needed_middle_blocks = num_blocks_to_select - len(selected_indices)
+        if needed_middle > 0 and middle_indices:
+            random.shuffle(middle_indices)
+            for i in range(min(needed_middle, len(middle_indices))):
+                selected_indices.add(middle_indices[i])
 
-        # Potential middle block indices (excluding first and last)
-        middle_block_indices = [i for i in range(1, len(all_blocks) - 1)]
+        result_parts = [all_blocks[i] for i in sorted(list(selected_indices))]
 
-        if needed_middle_blocks > 0 and middle_block_indices:
-            random.shuffle(middle_block_indices)
-            # Select the required number of middle blocks, or fewer if not enough available
-            for i in range(
-                min(needed_middle_blocks, len(middle_block_indices))
-            ):
-                selected_indices.add(middle_block_indices[i])
+        final_str = "...".join(result_parts)
+        # Add ellipsis if content was indeed truncated by selection
+        if len(all_blocks) > num_blocks_select and num_blocks_select > 0:
+            final_str += "..."
 
-        # Build the result string by joining selected blocks with "..."
-        result_parts: List[str] = []
-        # Ensure blocks are added in their original order
-        for block_idx in sorted(list(selected_indices)):
-            result_parts.append(all_blocks[block_idx])
-
-        final_separator = "..."
-        result = final_separator.join(result_parts)
-        if (
-            len(all_blocks) > len(selected_indices)
-            and len(selected_indices) > 0
-        ):
-            result += final_separator  # Add trailing "..." if truncated
-
-        return result
+        return final_str[:eff_max_chars]
 
     def _retrieve_summarized_content(
-        self, full_content: str, llm: BaseLLM
+        self,
+        full_content: str
     ) -> str:
-        context_max_chars = (
-            self.default_max_chars
-            if self.default_max_chars is not None
-            else self._SUMMARY_MODE_INTERNAL_MAX_CHARS
-        )
-        # Ensure it meets the minimum for random_chunks if using default_max_chars
-        if self.default_max_chars is not None:
-            context_max_chars = max(
-                context_max_chars, self._RANDOM_CHUNKS_MIN_MAX_CHARS
-            )
+        llm = self.llm
+        context_chars_limit = self._eff_max_chars_for_retrieval
+
+        if llm is None or context_chars_limit is None:
+            raise AssertionError("LLM or context limit not set for summarize.")
 
         context_for_summary = self._retrieve_random_chunks_content(
-            full_content, context_max_chars
+            full_content, context_chars_limit
         )
         if not context_for_summary.strip():
             raise ValueError("No content extracted from file to summarize.")
 
-        prompt = self._SUMMARY_PROMPT_TEMPLATE.format(
-            context=context_for_summary,
-            target_chars=self._SUMMARY_MODE_TARGET_LENGTH,
-        )
+        prompt = self.summary_prompt_template + context_for_summary
 
+        raw_summary = ""
         last_exception: Optional[Exception] = None
-        for attempt in range(3):
+        for attempt in range(3):  # Up to 3 attempts
             try:
-                raw_summary = llm.call(prompt)
-                if isinstance(raw_summary, str):
-                    summary = raw_summary.strip()
-                    # Ensure summary does not exceed target length
-                    if len(summary) >= self._SUMMARY_MIN_VALID_LENGTH:
-                        return summary[:self._SUMMARY_MODE_TARGET_LENGTH]
+                llm_response = llm.call(prompt)
+
+                if isinstance(llm_response, str):
+                    summary = llm_response.strip()
+
+                    if len(summary) >= _TOOL_FILE_SUMMARY_MIN_VALID_LENGTH:
+                        return summary[:_TOOL_FILE_SUMMARY_MODE_TARGET_LENGTH]
+                    else:
+                        raw_summary = summary
+                else:  # Non-string response
+                    raw_summary = str(llm_response)
             except Exception as e:
                 last_exception = e
-                if attempt == 2:  # Last attempt failed
-                    raise RuntimeError(
-                        "LLM call failed after 3 attempts to generate summary."
-                    ) from last_exception
 
-        # If loop finishes without returning (e.g., summary always too short)
-        raise ValueError(
-            "LLM failed to generate a valid summary meeting criteria "
-            f"(e.g., minimum length {self._SUMMARY_MIN_VALID_LENGTH}) "
-            "after 3 attempts."
-        )
+        # All attempts failed
+        error_msg_parts = [
+            "LLM failed to generate a valid summary after 3 attempts."
+        ]
+        if raw_summary:
+            error_msg_parts.append(
+                f"Last raw output (may be truncated): '{raw_summary[:200]}...'"
+            )
+        if last_exception:
+            error_msg_parts.append(
+                f"Last exception: {type(last_exception).__name__} - "
+                f"{str(last_exception)}"
+            )
+        raise ValueError(" ".join(error_msg_parts))
