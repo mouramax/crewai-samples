@@ -250,7 +250,8 @@ class VersatileFileReadTool(BaseTool):
             full_content_for_processing: Optional[str] = None
 
             if self.retrieval_mode != "full":
-                with open(eff_fp, "r", encoding="utf-8", errors="ignore") as f:
+                # Handle encoding mismatches gracefully by replacing invalid characters
+                with open(eff_fp, "r", encoding="utf-8", errors="replace") as f:
                     full_content_for_processing = f.read()
 
                 if (

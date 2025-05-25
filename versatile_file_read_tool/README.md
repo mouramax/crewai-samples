@@ -39,7 +39,7 @@ It primarily supports text-based files and reads them using UTF-8 encoding, with
 -   **Optional Default File Path**: A `file_path` can be set at initialization, which can be overridden by a `file_path` provided at runtime.
 -   **Dynamic LLM Description**: The tool's description, visible to the LLM, automatically adapts to reflect its specific configuration (e.g., retrieval mode, default file path).
 -   **Standardized JSON Output**: The `run` method returns a JSON string detailing the outcome, including `read_content`, `error_message`, `source_file_path`, and `retrieval_mode_used`.
--   **UTF-8 Encoding**: Reads files with UTF-8 encoding and ignores errors by default.
+-   **UTF-8 Encoding**: Reads input files with UTF-8 encoding and handles encoding mismatches gracefully by replacing invalid characters.
 -   **Intelligent Truncation**: For modes like `head` and `random_chunks`, if the file's total content is smaller than the effective `max_chars`, the full content is returned.
 -   **Clear Error Reporting**: Initialization errors raise Python exceptions. Runtime errors (e.g., file not found, permission issues, summarization failures) are reported within the JSON output's `error_message` field.
 
