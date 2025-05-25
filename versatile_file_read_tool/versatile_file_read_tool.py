@@ -35,7 +35,7 @@ class VersatileFileReadToolSchema(BaseModel):
         "If not provided, the tool's default file path (if configured) "
         "will be used.",
     )
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="ignore")
 
 
 class VersatileFileReadToolOutput(BaseModel):
@@ -218,6 +218,10 @@ class VersatileFileReadTool(BaseTool):
         self.description = base_desc_intro
         if details:
             self.description += " " + " ".join(details)
+        
+        # Rebuild the final description
+        self._generate_description()
+        
         return self
 
     def _run(
