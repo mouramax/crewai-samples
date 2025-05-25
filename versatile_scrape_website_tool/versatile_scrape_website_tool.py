@@ -51,7 +51,7 @@ class VersatileScrapeWebsiteToolSchema(BaseModel):
     website_url: str = Field(
         description=("Mandatory URL of the website to scrape for this run."),
     )
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
 
 class VersatileScraperToolOutput(BaseModel):
@@ -199,6 +199,10 @@ class VersatileScrapeWebsiteTool(BaseTool):
         self.description = base_desc
         if details:
             self.description += " " + " ".join(details)
+        
+        # Rebuild the final description
+        self._generate_description()
+
         return self
 
     def _run(
@@ -352,7 +356,8 @@ class VersatileScrapeWebsiteTool(BaseTool):
         return final_str[:eff_max_chars]
 
     def _retrieve_summarized_content(
-        self, full_content: str,
+        self,
+        full_content: str,
         llm: BaseLLM,
         context_chars_limit: int
     ) -> str:
